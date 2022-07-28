@@ -1,8 +1,3 @@
-# This is a sample Python script.
-
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
 import numpy as np
 import scipy as sci
 
@@ -11,17 +6,18 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 
 import torch
-import torchdiffeq
 import torch.optim as optim
-from ODE_Jacs import *
 
-BATCH_SIZE = 16
+from scipy.special import ellipj, ellipk
+from ODE_Jacs import *
+import os
+
+BATCH_SIZE = 50
 WEIGHT_DECAY = 0
-LEARNING_RATE = 1e-2
-NUMBER_EPOCHS = 60
-LE_BATCH_SIZE = 500
-T_MAX = 20
-METHOD = 'rk4'
+LEARNING_RATE = 5e-3
+NUMBER_EPOCHS = 1000
+
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 
 def set_seed(seed=0):
@@ -31,89 +27,91 @@ def set_seed(seed=0):
     torch.cuda.manual_seed(seed)
 
 
-def create_data(b=0.0, k=0.0, tmax=20, dt=0.4):
-    grid = np.arange(0, tmax, dt)
-
-    # Do the numerical integration of the equations of motion
-    x = solve_ivp(pendulum, (0, tmax), y0=np.array([2.6, 0.0]), args=(b, k), t_eval=grid)
-    x2 = solve_ivp(pendulum, (0, tmax), y0=np.array([1.4, 0.0]), args=(b, k), t_eval=grid)
-
-    return x, x2, grid
-
-
-def plot_pendulum(b=0.0, k=0.0):
-    theata, velocity = np.meshgrid(np.arange(-2 * np.pi, 2 * np.pi, 0.01), np.arange(-2.5, 2.5, 0.01))
-    theata_dot = velocity
-    velocity_dot = b * velocity - np.sin(theata) + k
-
-    plt.figure(figsize=(15, 5))
-    color = np.hypot(theata_dot, velocity_dot)
-    plt.streamplot(theata, velocity, theata_dot, velocity_dot, color=color, linewidth=1, cmap=plt.cm.RdBu,
-                   density=2, arrowstyle='->', arrowsize=1.5)
-
-    plt.tight_layout()
+def create_simple_data(tmax=20, dt=1, theta0=2.0, d_theta0 = 0.0):
+    t = np.arange(0, tmax, dt)
+    g = 9.81
+    omega_0 = np.sqrt(g)
+    S = np.sin(omega_0*t)
+    C = np.cos(omega_0*t)
+    d_theta_dt = -omega_0*theta0*S + d_theta0*C
+    theta = theta0*C + d_theta0/omega_0*S
+    return np.stack([theta, d_theta_dt], axis=1)
 
 
-def pendulum(t, x, b=0, k=0, drag=0.0):
-    theta, velocity = x
-    theata_dot = velocity
-    velocity_dot = -b * velocity - np.sin(theta) + drag * np.cos(k * t)
-
-    return theata_dot, velocity_dot
-
-
-def plot_data(x, x2, figsize=(15, 5)):
-    fig = plt.figure(figsize=(15, 5))
-
-    ax = fig.add_subplot(121)
-    ax.plot(grid, x.y[0], 'o--', label=r'$\theta(0)=2.4$', c='#dd1c77')
-    ax.plot(grid, x2.y[0], 's--', label=r'$\theta(0)=2.0$', c='#2c7fb8')
-    ax.tick_params(axis='x', labelsize=14)
-    ax.tick_params(axis='y', labelsize=14)
-    ax.tick_params(axis='both', which='minor', labelsize=14)
-    ax.set_ylabel(r'angular displacement, ${\theta}(t)$', fontsize=14)
-    ax.set_xlabel('time, t', fontsize=14)
-    ax.legend(loc='lower right', fontsize=14)
-
-    ax2 = fig.add_subplot(122)
-    ax2.plot(grid, x.y[1], 'o--', label=r'$\theta(0)=2.4$', c='#dd1c77')
-    ax2.plot(grid, x2.y[1], 's--', label=r'$\theta(0)=2.0$', c='#2c7fb8')
-    ax2.tick_params(axis='x', labelsize=14)
-    ax2.tick_params(axis='y', labelsize=14)
-    ax2.tick_params(axis='both', which='minor', labelsize=14)
-    ax2.set_ylabel(r'angular velocity, ${v}(t)$', fontsize=14)
-    ax2.set_xlabel('time, t', fontsize=14)
-    ax2.legend(loc='lower right', fontsize=14)
-    plt.show()
+def create_data(tmax=20, dt=1, theta0=2.0, d_theta0 = 0.0):
+    """Solution for the nonlinear pendulum in theta space."""
+    t = np.arange(0, tmax, dt)
+    g = 9.81
+    alpha = np.arccos(np.cos(theta0) - 0.5*d_theta0**2/g)
+    S = np.sin(0.5*alpha)
+    K_S = ellipk(S**2)
+    omega_0 = np.sqrt(g)
+    sn,cn,dn,ph = ellipj( K_S - omega_0*t, S**2 )
+    theta = 2.0*np.arcsin( S*sn )
+    d_sn_du = cn*dn
+    d_sn_dt = -omega_0 * d_sn_du
+    d_theta_dt = 2.0*S*d_sn_dt / np.sqrt(1.0-(S*sn)**2)
+    return np.stack([theta, d_theta_dt], axis=1)
 
 
-def create_dataloader(x, x2, batch_size=BATCH_SIZE):
+def create_dataloader(x, batch_size=BATCH_SIZE):
     dataset = torch.utils.data.TensorDataset(
-        torch.tensor(np.asarray([x.y[0][0:-1], x.y[1][0:-1]]).T, dtype=torch.float),
-        torch.tensor(np.asarray([x.y[0][1:], x.y[1][1:]]).T, dtype=torch.float),
-        torch.tensor(np.asarray([x.t[1:] - x.t[0:-1]]).reshape(-1, 1), dtype=torch.float),
+        torch.tensor(np.asarray(x[0:-1]), dtype=torch.double),
+        torch.tensor(np.asarray(x[1::]), dtype=torch.double),
     )
 
     train_loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE)
 
     dataset = torch.utils.data.TensorDataset(
-        torch.tensor(np.asarray([x2.y[0][0:-1], x2.y[1][0:-1]]).T, dtype=torch.float),
-        torch.tensor(np.asarray([x2.y[0][1:], x2.y[1][1:]]).T, dtype=torch.float),
-        torch.tensor(np.asarray([x2.t[1:] - x2.t[0:-1]]).reshape(-1, 1), dtype=torch.float),
+        torch.tensor(np.asarray(x[0:-1]), dtype=torch.double),
+        torch.tensor(np.asarray(x[1::]), dtype=torch.double),
     )
 
-    test_loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
-    le_loader = torch.utils.data.DataLoader(dataset, batch_size=LE_BATCH_SIZE, shuffle=False)
-    return train_loader, test_loader, le_loader
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
 
 
-def create_predset(b= 0.0, k= 0.0, tmax= 20, h= 0.4, length= BATCH_SIZE):
-    _, x2, grid = create_data(b, k, tmax, h)
+def euler_step_func(f, x, dt, monitor = False):
+    """The 'forward' Euler, a one stage Runge Kutta."""
+    k1 = f(x)
+    x_out = x + dt * k1
+    if monitor:
+        return x_out, k1
+    else:
+        return x_out
 
-    y0 = torch.tensor(np.asarray([x2.y[0][0:-1], x2.y[1][0:-1]]).T, dtype=torch.float)
-    y1 = torch.tensor(np.asarray([x2.y[0][1:], x2.y[1][1:]]).T, dtype=torch.float)
-    t = torch.tensor(np.asarray([x2.t[1:] - x2.t[0:-1]]).reshape(-1, 1), dtype=torch.float)
-    return y0, y1, t
+
+def rk4_step_func(f, x, dt, monitor = False):
+    """The 'classic' RK4, a four stage Runge Kutta, O(Dt^4)."""
+    k1 = f(x)
+    x1 = x + 0.5 * dt * k1
+    k2 = f(x1)
+    x2 = x + 0.5 * dt * k2
+    k3 = f(x2)
+    x3 = x + dt * k3
+    k4 = f(x3)
+    x_out = x + dt * (1.0 / 6.0 * k1 + 1.0 / 3.0 * k2 + 1.0 / 3.0 * k3 +
+                      1.0 / 6.0 * k4)
+    if monitor:
+        return x_out, torch.vstack([k1, k2, k3, k4])
+    else:
+        return x_out
+
+
+def rk4_38_step_func(f, x, dt, monitor=False):
+    """"The alternate '3/8' RK4, a four-stage Runge Kutta with different coefficients """
+    k1 = f(x)
+    x1 = x + 1.0/3.0 * dt * k1
+    k2 = f(x1)
+    x2 = x + (-1.0/3.0 * k1 + k2) * dt
+    k3 = f(x2)
+    x3 = x + (k1 - k2 + k3)*dt
+    k4 = f(x3)
+    x_out = x + dt * 1.0/8.0 * (k1 + 3 * k2 + 3 *k3 + k4)
+    if monitor:
+        return x_out, torch.vstack([k1, k2, k3, k4])
+    else:
+        return x_out
 
 
 def shallow(in_dim, hidden, out_dim, Act=torch.nn.Tanh):
@@ -124,29 +122,6 @@ def shallow(in_dim, hidden, out_dim, Act=torch.nn.Tanh):
         torch.nn.Linear(hidden, out_dim), )
 
 
-class ShallowNet(torch.nn.Module):
-    """Just a basic shallow network"""
-
-    def __init__(self, in_dim, out_dim, hidden=10, Act=torch.nn.Tanh):
-        super(ShallowNet, self).__init__()
-        self.net = shallow(in_dim, hidden, out_dim, Act=Act)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class ShallowSkipNet(torch.nn.Module):
-    """A basic shallow network with a skip connection"""
-
-    def __init__(self, in_dim, out_dim, hidden=10, Act=torch.nn.Tanh, eps=1.0):
-        super(ShallowSkipNet, self).__init__()
-        self.eps = eps
-        self.net = shallow(in_dim, hidden, out_dim, Act=Act)
-
-    def forward(self, x):
-        return x + self.eps * self.net(x)
-
-
 class ShallowODE(torch.nn.Module):
     """A basic shallow network that takes in a t as well"""
 
@@ -154,134 +129,226 @@ class ShallowODE(torch.nn.Module):
         super(ShallowODE, self).__init__()
         self.net = shallow(in_dim, hidden, out_dim, Act=Act)
 
-    def forward(self, t, x):
-        return self.net(x)
+    def forward(self, x, h, dt, method='euler'):
+        if method=='euler':
+            #print(method)
+            #for i in range(int(dt/h)):
+            x = euler_step_func(self.net, x, dt)
+            return x
+        elif method=='rk4':
+            #print(method)
+            #for i in range(int(dt/h)):
+            x = rk4_step_func(self.net, x, dt)
+            return x
+        elif method=='rk4_38':
+            #print(method)
+            #for i in range(int(dt/h)):
+            x = rk4_38_step_func(self.net, x, dt)
+            return x
 
 
-def train(net, ODEnet, train_loader, lr=LEARNING_RATE, wd=WEIGHT_DECAY, method='rk4'):
-    optimizer_net = optim.Adam(net.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+def train(ODEnet, train_loader, lr=LEARNING_RATE, wd=WEIGHT_DECAY, method='rk4', dt=0.1):
+
     optimizer_ODEnet = optim.Adam(ODEnet.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     criterion = torch.nn.MSELoss()
-    loss_hist = []
-    print('Standard Net Training')
-    for epoch in range(1, NUMBER_EPOCHS):
-        for batch_idx, (inputs, targets, dt) in enumerate(train_loader):
-            outputs = net(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer_net.step()
-            optimizer_net.zero_grad()
-        loss_hist.append(loss.item())
-
-        if epoch % 10 == 0: print(f'Epoch: {epoch}, Loss: {loss.item()}')
-
     ode_loss_hist = []
     print('ODENet Training')
     for epoch in range(1, NUMBER_EPOCHS):
-        for batch_idx, (inputs, targets, dt) in enumerate(train_loader):
-            outputs = torchdiffeq.odeint(ODEnet, inputs, torch.tensor([0, dt[0]]).float(), method=method)[-1, :, :]
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            optimizer_ODEnet.zero_grad()
+            outputs = ODEnet(inputs, h=dt, dt=dt, method=method)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer_ODEnet.step()
-            optimizer_ODEnet.zero_grad()
-        ode_loss_hist.append(loss.item())
+            ode_loss_hist.append(loss.item())
 
-        if epoch % 10 == 0: print(f'Epoch: {epoch}, Loss: {loss.item()}')
+        if epoch % 50 == 0: print(f'Epoch: {epoch}, Loss: {loss.item()}')
 
-    return net, ODEnet, loss_hist, ode_loss_hist
-
-
-def evaluate(net, ODEnet, test_loader, method='rk4', h= 0.1):
-    preds_net = []
-    for batch_idx, (inputs, targets, dt) in enumerate(test_loader):
-        preds = net(inputs).detach().numpy()
-        preds_net.append(preds)
-    preds_net = np.vstack(preds_net)
-
-    preds_ODEnet = []
-    for batch_idx, (inputs, targets, dt) in enumerate(test_loader):
-        preds = torchdiffeq.odeint(ODEnet, inputs, torch.tensor([0, h]).float(), method=method)[-1, :,
-                :].detach().numpy()
-        preds_ODEnet.append(preds)
-    preds_ODEnet = np.vstack(preds_ODEnet)
-
-    return preds_net, preds_ODEnet
+    return ODEnet, ode_loss_hist
 
 
-def predict(ODEnet, test_loader, method = 'rk4', h= 0.1):
-    preds_odenet = []
-    inputs, targets, dt = next(iter(test_loader))
-    # print(f't steps: {T_MAX/h}')
-    for batch_idx in range(int(T_MAX/h)):
-        if batch_idx == 0:
-            preds = torchdiffeq.odeint(ODEnet, inputs[:1], torch.tensor([0, h]).float(), method=method)[-1, :,
-                :].detach().numpy()
-            preds_odenet.append(preds)
-        else:
-            preds = torchdiffeq.odeint(ODEnet, torch.Tensor(preds), torch.tensor([0, h]).float(), method=method)[-1, :,
-                    :].detach().numpy()
-            preds_odenet.append(preds)
-    preds_odenet = np.vstack(preds_odenet)
-    return preds_odenet
-
-
-# Press the green button in the gutter to run the script.
 if __name__ == '__main__':
     dt = 0.1
-    eps = 0.1
-    x, x2, grid = create_data(tmax=T_MAX, dt=dt)
-    # plot_pendulum()
-    train_loader, test_loader, le_loader = create_dataloader(x, x2)
-    integrator = 'euler'
-    hidden = 100
+    eps = -1
+    theta_0 = 2.0
+    d_theta_0 = 2.0
+    omega_0 = np.sqrt(9.81)
+    N_points = 500
+    LE_points = 10000
+    T_MAX = N_points * dt
+    n_points = 100
+    cloud_size = 0.8
+    set_seed(5544)
 
-    set_seed(10 ** 3)
-    net = ShallowNet(in_dim=2, hidden=hidden, out_dim=2, Act=torch.nn.Tanh)
+    theta_0s, d_theta_0s = theta_0+cloud_size*(np.random.rand(n_points)-0.5), d_theta_0+cloud_size*(np.random.rand(n_points)-0.5)
+    e_steps = 10
 
-    set_seed(10 ** 3)
-    ODEnet = ShallowODE(in_dim=2, hidden=hidden, out_dim=2, Act=torch.nn.Tanh)
+    for e_steps in [10, 25, 60, 100, 500]:
+        fig = plt.figure(figsize=(8, 6))
+        circle1 = plt.Circle((theta_0, d_theta_0), cloud_size, color='k', alpha=0.2)
+        for idx, (theta_0i, d_theta_0i) in enumerate(zip(theta_0s, d_theta_0s)):
+            x = create_data(tmax=T_MAX*10, dt=dt, theta0=theta_0i, d_theta0=d_theta_0i)
+            i_x = np.where((np.abs(x[:, 0] - theta_0i)<10e-3) & (np.abs(x[:, 1]-d_theta_0i)<10e-3))[0]
+            if i_x.shape[0] == 0:
+                continue
+            elif i_x[0]+e_steps < x.shape[0]:
+                plt.plot(x[i_x[0]:i_x[0] + e_steps, 0], x[i_x[0]:i_x[0] + e_steps, 1], alpha=0.1)
+                xs = np.stack([x[i_x[0]], x[i_x[0]+e_steps]])
+                plt.scatter(xs[:, 0], xs[:, 1], s=8, c = 'k')
+        # plt.legend()
+        fig = plt.gcf()
+        ax = fig.gca()
+        ax.add_patch(circle1)
+        plt.title(f'Nonlinear Evolution of Cloud of Initial Points for {e_steps} Steps')
+        plt.xlabel(r'$\theta$')
+        plt.ylabel(r'$\frac{d\theta}{dt}$')
+        plt.savefig(f'Figures/cloud_steps{e_steps}.png')
+        plt.close()
 
-    net, ODEnet, loss_hist, ode_loss_hist = train(net, ODEnet, train_loader)
-    batch_y, batch_y2, batch_t = next(iter(le_loader))
-    k1_test = ODEnet(batch_t, batch_y)
-    print(f'batch_t shape: {batch_t.shape}')
-    preds_list = []
-    # pred_f = plt.figure()
-    # plt.plot(batch_t[:, 0].cumsum(dim=0), batch_y2[:, 0], label= 'actual')
-    error = []
+        fig = plt.figure(figsize=(8, 6))
+        circle1 = plt.Circle((theta_0, d_theta_0), cloud_size, color='k', alpha=0.2)
+        for idx, (theta_0i, d_theta_0i) in enumerate(zip(theta_0s, d_theta_0s)):
+            x = create_simple_data(tmax=T_MAX * 10, dt=dt, theta0=theta_0i, d_theta0=d_theta_0i)
+            i_x = np.where((np.abs(x[:, 0] - theta_0i) < 10e-3) & (np.abs(x[:, 1] - d_theta_0i) < 10e-3))[0]
+            if i_x.shape[0] == 0:
+                continue
+            elif i_x[0] + e_steps < x.shape[0]:
+                plt.plot(x[:e_steps, 0], x[i_x[0]:i_x[0] + e_steps, 1], alpha=0.1)
+                xs = np.stack([x[i_x[0]], x[i_x[0] + e_steps]])
+                plt.scatter(xs[:, 0], xs[:, 1], s=8, c='k')
+        # plt.legend()
+        fig = plt.gcf()
+        ax = fig.gca()
+        ax.add_patch(circle1)
+        plt.title(f'Simple (Linear) Evolution of Cloud of Initial Points for {e_steps} Steps')
+        plt.xlabel(r'$\theta$')
+        plt.ylabel(r'$\frac{d\theta}{dt}$')
+        plt.savefig(f'Figures/cloud_steps{e_steps}_simple.png')
+        plt.close()
 
-    hs = [0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1]
-    for h in hs:
-        preds_net, preds_odenet = evaluate(net, ODEnet, test_loader, method=integrator, h= h)
-        # y0, y1, t = create_predset(tmax= T_MAX, h= h)
-        # plt.plot(t.cumsum(dim=0), y1[:, 0], label= f'actual, h={h}')
-        # full_preds = predict(ODEnet, test_loader, method=integrator, h= h)
-        # plt.plot(torch.arange(start= 0, end = T_MAX, step = h), full_preds[:, 0], label=f'pred: h={h}')
-        error.append(torch.linalg.norm(torch.Tensor(preds_odenet[-1])-batch_y2[-1]))
-        preds_list.append(preds_odenet)
-        LEs, rvals, ynew = ode_lyapunov(ODEnet, batch_t, batch_y, h=h, integrator=integrator)
-        # print(rvals.diagonal(dim1=-2, dim2=-1).shape)
-        print(f'LEs for {integrator}, h = {h}:   \t {LEs}')
-    error = torch.vstack(error)
-    plt.figure()
-    plt.title(f'Errors for {integrator}, ' + r'$\Delta t =$' + f'{dt}')
-    plt.scatter(hs, error)
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xlabel('h')
-    plt.ylabel('error')
-    plt.savefig(f'Errors_{integrator}.png')
+    train_loader, test_loader = create_dataloader(x)
+    errors = {}
+
+    y_in, _ = next(iter(test_loader))
+    nonlinear_pendulum(y_in)
 
     f = plt.figure()
-    plt.title(f'LE value evolution over time, eps = {eps}')
-    plt.xlabel('Time Step')
-    plt.ylabel('LE value')
-    plt.legend([r'$\lambda_1$', r'$\lambda_2$'])
-    plt.plot(torch.log2(rvals.diagonal(dim1=-2, dim2=-1)).cumsum(dim=0).detach() / ((batch_t / dt).cumsum(dim=0)))
-    #
+    for integrator in ['euler', 'rk4', 'dy_sys']:
+    # for integrator in ['dy_sys']:
+        hidden = 100
+        model_name = f'Models/model_{integrator}.p'
 
-    # plt.plot(ynew[:], label='predicted')
-    # plt.legend()
-    # plt.savefig(f'y_{integrator}.png')
-    plt.show()
+        if (integrator != 'dy_sys') and (integrator != 'simple'):
+            if os.path.isfile(model_name):
+                print(f'Loading {integrator} Model')
+                ODEnet, ode_loss_hist = torch.load(model_name, map_location=device)
+            else:
+                ODEnet = ShallowODE(in_dim=2, hidden=hidden, out_dim=2, Act=torch.nn.Tanh).double()
+                ODEnet, ode_loss_hist = train(ODEnet, train_loader, method=integrator, dt=dt)
+                torch.save((ODEnet, ode_loss_hist), model_name)
+        error = []
+        LE_list = []
+
+        # Evaluate the model --
+        hs = [0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 10]
+        # hs = [0.001, 0.01, 0.1,  1, 10]
+        f = plt.figure(1)
+        for h in hs:
+            x = torch.Tensor(create_data(tmax=T_MAX, dt=h)).double()
+            _, test_loader = create_dataloader(x)
+            le_file = f'LEs/{integrator}_h{h}_LEs.p'
+            if integrator == 'dy_sys':
+                if os.path.isfile(le_file):
+                    LEs, rvals, J = torch.load(le_file, map_location = device)
+                    print(f'LEs for {integrator}, h = {h}: {LEs.data}')
+                else:
+                    x_le = torch.Tensor(create_data(tmax= np.min((LE_points*h, LE_points)), dt=h)).double()
+                    LEs, rvals, J = dysys_lyapunov(x_le, h=h, system='pendulum')
+                    torch.save((LEs, rvals, J), le_file)
+                plt.figure(3)
+                # expected_J = np.abs(omega_0**2*np.sin(x_le[:, 0]))
+                # plt.plot(torch.ones_like(x_le[:, 0]).cumsum(dim=0) * h - h, rvals[:, 0, 0].cpu(), label='rvals')
+                # plt.plot(torch.ones_like(x_le[:, 0]).cumsum(dim=0) * h - h, expected_J[:], label='exp')
+                # plt.plot(torch.ones_like(x_le[:, 0]).cumsum(dim=0) * h - h, np.abs(x_le[:, 1]), label='exp')
+                # plt.legend()
+                # plt.show()
+                plt.close()
+            else:
+                target_list = []
+                output_list = []
+                diff_list = []
+                for batch_idx, (inputs, targets) in enumerate(test_loader):
+                    outputs = ODEnet(inputs, h=h, dt=h, method=integrator)
+                    output_list.append(outputs.detach().numpy())
+                    target_list.append(targets.numpy())
+
+                error.append(np.mean(np.linalg.norm(np.vstack(output_list)-np.vstack(target_list), axis=1)**2))
+
+                if os.path.isfile(le_file):
+                    LEs, rvals, J = torch.load(le_file, map_location=device)
+                    print(f'LEs for {integrator}, h = {h}: {LEs.data}')
+                else:
+                    x_le = create_data(tmax= np.min((LE_points*h, LE_points)), dt=h)
+                    _, le_loader = create_dataloader(x_le, batch_size=x_le.shape[0])
+                    le_inputs, _ = next(iter(le_loader))
+                    LEs, rvals, J = ode_lyapunov(ODEnet.net, le_inputs, h=h, integrator=integrator)
+                    torch.save((LEs, rvals, J), le_file)
+
+            plt.figure(3)
+            plt.plot(J[:200, 0, 0], label='J(0,0)')
+            plt.plot(J[:200, 0, 1], label='J(0,1)')
+            plt.plot(J[:200, 1, 0], label='J(1,0)')
+            plt.plot(J[:200, 1, 1], label='J(1,1)')
+            plt.legend()
+            plt.xlabel('Time Step')
+            plt.title(f'Jacobian values for {integrator}, h = {h}')
+            plt.savefig(f'Figures/Jacs_{integrator}_h{h}.png')
+            plt.close()
+
+            LE_list.append(LEs)
+            print(f'LEs for {integrator}, h = {h}:   \t {LEs}')
+            f_rval = plt.figure()
+            plt.title(f'LE value evolution over time, eps = {eps}')
+            plt.xlabel('Time Step')
+            plt.ylabel('LE value')
+            plt.legend([r'$\lambda_1$', r'$\lambda_2$'])
+            rv_plot = torch.log2(rvals.diagonal(dim1=-2, dim2=-1)).cumsum(dim=0).detach().cpu()
+            plt.plot(rv_plot / (torch.ones_like(rv_plot)).cumsum(dim=0))
+            plt.ylim([-0.5, 2.5])
+            plt.savefig(f'Figures/rvals_{integrator}_h{h}.png')
+            plt.close(f_rval.number)
+
+        if integrator in ['euler', 'rk4']:
+            error = np.vstack(error)
+            errors[integrator] = error
+            plt.figure(1)
+            plt.plot(hs, error, 'o--', label=integrator)
+        else:
+            plt.figure(3)
+            plt.legend(title='h')
+            plt.xlabel('t')
+            plt.tight_layout()
+            plt.title('Generated Data as function of h')
+            plt.savefig(f'Figures/traj_{integrator}.png', dpi=300)
+            plt.close()
+        LE_list = torch.vstack(LE_list).cpu()
+        plt.figure(2)
+        plt.scatter(torch.Tensor(hs).unsqueeze(1).repeat(1, 2), LE_list, label=integrator)
+
+plt.figure(2)
+plt.legend(title = 'Method')
+plt.xscale('log')
+plt.xlabel('h')
+plt.ylabel('Lyapunov Exponent')
+plt.savefig(f'Figures/LE_v_h.png')
+plt.close()
+
+plt.figure(1)
+plt.yscale('log')
+plt.xscale('log')
+plt.legend(fontsize=18)
+plt.tight_layout()
+plt.savefig(f'Models_errors_v_h.png')
+plt.show()
+

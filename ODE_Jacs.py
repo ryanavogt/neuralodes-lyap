@@ -3,16 +3,42 @@ import torch
 
 
 def net_der(model, xi, yi):
-    W = model.net[0].weight
-    b = model.net[0].bias
-    Wout = model.net[-1].weight
-    bout = model.net[-1].bias
+    W = model[0].weight
+    b = model[0].bias
+    Wout = model[-1].weight
+    bout = model[-1].bias
     arg = yi @ W.T + b
-    der = (1 - torch.tanh(arg) ** 2) * W.T
+    der = (1 - torch.tanh(arg) ** 2).unsqueeze(1) * W.T.unsqueeze(0)
     # print(der.shape)
     der_out = der @ Wout.T
     # print(f'der out shape: {der_out.shape}')
     return der_out
+
+
+def numerical_der(model, xi, yi, eps= 0.01):
+    n_dims = yi.shape[-1]
+    delta= eps*torch.eye(n_dims)
+    with torch.no_grad():
+        y_init= yi.unsqueeze(0).repeat(n_dims,1)
+        yi_fwd = y_init + delta
+        yi_bwd = y_init - delta
+        print(f'yi {yi}')
+        print(f'yi_fwd {yi_fwd}')
+        fwd = model(xi, yi_fwd)
+        bwd = model(xi, yi_bwd)
+        jac = (fwd-bwd)/(2*eps)
+    return jac
+
+
+def nonlinear_pendulum(y, omega_0 = torch.sqrt(torch.Tensor([9.81])).double()):
+    dtheta = y[:, -1].unsqueeze(-1)
+    dtheta = torch.hstack([torch.zeros_like(dtheta), dtheta])
+    dv = -omega_0**2 * torch.sin(y[:, 0]).double().unsqueeze(-1)
+    dv = torch.hstack([dv, torch.zeros_like(dv)])
+    # dy = torch.vstack([dtheta, dv]).T
+    J = torch.dstack([dtheta, dv])
+    # print(f'dy shape: {dy.shape}')
+    return J
 
 
 def rk_alt(model, xi, yi, h=0.01):
@@ -24,12 +50,18 @@ def rk_alt(model, xi, yi, h=0.01):
     return ynew
 
 
-def ode_jacobian(model, xi, yi, h=0.01, integrator='rk4'):
-    if integrator == 'rk4':
+def integrate_step(model, yi, xi=0, h=0.01, integrator='rk4'):
+    if integrator == 'rk4_38':
         order = 4
         A = torch.Tensor([[0, 0, 0, 0], [1 / 3, 0, 0, 0], [-1 / 3, 1, 0, 0], [1, -1, 1, 0]])
         b = torch.Tensor([1 / 8, 3 / 8, 3 / 8, 1 / 8])
         c = torch.Tensor([0, 1 / 3, 2 / 3, 1])
+
+    if integrator == 'rk4':
+        order = 4
+        A = torch.Tensor([[0, 0, 0, 0], [1 / 2, 0, 0, 0], [0, 1 / 2, 0, 0], [0, 0, 1, 0]])
+        b = torch.Tensor([1 / 6, 1 / 3, 1 / 3, 1 / 6])
+        c = torch.Tensor([0, 1 / 2, 1 / 2, 1])
 
     if integrator == 'euler':
         order = 1
@@ -43,34 +75,82 @@ def ode_jacobian(model, xi, yi, h=0.01, integrator='rk4'):
         b = torch.Tensor([0, 1])
         c = torch.Tensor([0, 1/2])
 
+    batch_size = yi.shape[0]
+    dims = yi.shape[-1]
+
     # Calculate quantities for integrator
-    K = torch.zeros((order + 1, yi.shape[-1]))
-    K[0] = yi
-    dy = torch.zeros((order, yi.shape[-1]))
+    # print(f'yi shape: {yi.shape}')
+    K = torch.zeros((order, batch_size, dims))
+    dy = torch.zeros((order, batch_size, dims))
+
     # Calculate K's of integration method
     for i in range(order):
-        dy[i] = (A[i].unsqueeze(0) @ K[1:])*h
-        k = model(xi + c[i] * h, yi + dy[i])
-        K[i + 1] = k
-    ynew = yi + (b.unsqueeze(0)@(K[1:])).squeeze()*h
-    k_prods = b.unsqueeze(-1) * (K[1:])
-    # print(f'k prods: {k_prods}')
-    # print(f'ynew alt: {ynew.data}')
+        # print(f'A Shape: {A[i].unsqueeze(0).shape}')
+        # print(f'K Shape: {K[1:].shape}')
+        dy[i] = (A[i].unsqueeze(0) @ K.transpose(0, 1)).sum(dim=1)*h
+        k = model(yi + dy[i])
+        K[i] = k
+    # print(f'bprod shape: {(b.unsqueeze(0)@(K[1:].transpose(0,1))).shape}')
+    ynew = yi + (b.unsqueeze(0)@(K.transpose(0,1))).squeeze()*h
+
+    return ynew
+
+
+def ode_jacobian(model, yi, xi=0, h=0.01, integrator='rk4'):
+    if integrator == 'rk4_38':
+        order = 4
+        A = torch.Tensor([[0, 0, 0, 0], [1 / 3, 0, 0, 0], [-1 / 3, 1, 0, 0], [1, -1, 1, 0]])
+        b = torch.Tensor([1 / 8, 3 / 8, 3 / 8, 1 / 8])
+        c = torch.Tensor([0, 1 / 3, 2 / 3, 1])
+
+    elif integrator == 'rk4':
+        order = 4
+        A = torch.Tensor([[0, 0, 0, 0], [1 / 2, 0, 0, 0], [0, 1 / 2, 0, 0], [0, 0, 1, 0]])
+        b = torch.Tensor([1 / 6, 1 / 3, 1 / 3, 1 / 6])
+        c = torch.Tensor([0, 1 / 2, 1 / 2, 1])
+
+    elif integrator == 'euler':
+        order = 1
+        A=torch.Tensor([[0]])
+        b=torch.Tensor([1])
+        c=torch.Tensor([0])
+
+    elif integrator == 'midpoint':
+        order = 2
+        A = torch.Tensor([[0, 0], [1/2, 0]])
+        b = torch.Tensor([0, 1])
+        c = torch.Tensor([0, 1/2])
+
+    # Calculate quantities for integrator
+    batch_size = yi.shape[0]
+    dims = yi.shape[-1]
+
+    # Calculate quantities for integrator
+    # print(f'yi shape: {yi.shape}')
+    K = torch.zeros((order, batch_size, dims))
+    dy = torch.zeros((order, batch_size, dims))
+
+    # Calculate K's of integration method
+    for i in range(order):
+        dy[i] = (A[i].unsqueeze(0) @ K.transpose(0, 1)).sum(dim=1)*h
+        k = model(yi + dy[i])
+        K[i] = k
+    ynew = yi + (b.unsqueeze(0)@(K.transpose(0,1))).squeeze()*h
 
     # Calculate derivative of K's
-    Kp = torch.zeros((order, yi.shape[-1], yi.shape[-1]))
-    I = torch.eye(yi.shape[-1])
+    Kp = torch.zeros((order, batch_size, dims, dims))
+    I = torch.eye(dims).unsqueeze(0).repeat(batch_size, 1, 1).float()
     for i in range(order):
-        ks = torch.sum(A[i].unsqueeze(-1).unsqueeze(-1) * Kp * h, dim=0)
-        kp = net_der(model, xi + c[i] * h, yi + dy[i])
+        ks = torch.sum(A[i].unsqueeze(-1).unsqueeze(-1).unsqueeze(0) * Kp.transpose(0,1) * h, dim=1).float()
+        kp = net_der(model, xi + c[i] * h, yi + dy[i]).float()
         Kp[i] = kp @ (I + ks)
     # Combine K derivatives to get full derivative
-    dyn = I + (b.unsqueeze(-1).unsqueeze(-1) * (Kp)).sum(dim=0)
+    dyn = I + (b.unsqueeze(-1).unsqueeze(-1).unsqueeze(0) * (Kp.transpose(0,1))).sum(dim=1)
     # print(f'dy:\n {dy}')
-    return dyn, ynew.detach()
+    return dyn
 
 
-def ode_lyapunov(model, x_list, y_list, h=0.01, eps= 0.1, integrator='rk4'):
+def ode_lyapunov(model, y_list, h=0.01, eps= 1, integrator='rk4'):
     cuda = next(model.parameters()).is_cuda
     if cuda:
         device = torch.device('cuda')
@@ -79,17 +159,63 @@ def ode_lyapunov(model, x_list, y_list, h=0.01, eps= 0.1, integrator='rk4'):
     seq_length, state_dim = y_list.shape
     rvals = torch.eye(state_dim).unsqueeze(0).repeat(seq_length, 1, 1).to(device)  # storage
     Q = torch.eye(state_dim)*eps
-    ynew_list = []
-    for i in range(seq_length):
-        J, ynew = ode_jacobian(model, x_list[i], y_list[i], h=h, integrator=integrator)
-        ynew_list.append(ynew)
-        Q = torch.matmul(J, Q)
-        qr_dict = oneStepVarQR(J, Q)
-        Q, r = qr_dict['Q']*eps, qr_dict['R']/eps
-        rvals[i] = r
+
+    with torch.no_grad():
+        # First, warmup to get eigenvectors to converge
+        J= ode_jacobian(model, y_list, h=h, integrator=integrator)
+        # ynew_list.append(ynew)
+        for i in range(seq_length):
+            qr_dict = oneStepVarQR(J[i], Q)
+            Q, r = qr_dict['Q']*eps, qr_dict['R']/eps
+
+        # Then, calculate evolution and track R values simultaneously
+        J = ode_jacobian(model, y_list, h=h, integrator=integrator)
+        # ynew_list.append(ynew)
+        for i in range(seq_length):
+            qr_dict = oneStepVarQR(J[i], Q)
+            Q, r = qr_dict['Q']*eps, qr_dict['R']/eps
+            rvals[i] = r
     LEs = torch.sum(torch.log2(torch.diagonal(rvals.detach(), dim1=-2, dim2=-1)), dim=-2)/seq_length
     # print(f'rval sum: {torch.log2(rvals.diagonal(dim1=-2, dim2=-1)).sum(dim=-2)}')
-    return LEs, rvals, torch.stack(ynew_list)
+    return LEs, rvals, J
+
+
+def dysys_lyapunov(y_list, h=0.01, eps=1, system='pendulum'):
+    cuda = torch.cuda.is_available()
+    if cuda:
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    if system == 'pendulum':
+        f = nonlinear_pendulum
+    seq_length, state_dim = y_list.shape
+    qvects = []
+    rvals = torch.eye(state_dim).unsqueeze(0).repeat(seq_length, 1, 1).to(device)  # storage
+    Q = torch.eye(state_dim).double() * eps
+
+    with torch.no_grad():
+        # First, warmup to get eigenvectors to converge
+        J = f(y_list)
+        # ynew_list.append(ynew)
+        for i in range(seq_length):
+            # Q = torch.matmul(J[i], Q)
+            qr_dict = oneStepVarQR(J[i], Q)
+            Q, r = qr_dict['Q'] * eps, qr_dict['R'] / eps
+
+        # Then, calculate evolution and track R values simultaneously
+        J = f(y_list)
+        # ynew_list.append(ynew)
+        for i in range(seq_length):
+            # Q = torch.matmul(J[i], Q)
+            qr_dict = oneStepVarQR(J[i], Q)
+            Q, r = qr_dict['Q'] * eps, qr_dict['R'] / eps
+            qvects.append(Q)
+            rvals[i] = r
+    qvects = torch.vstack(qvects)
+    LEs = torch.sum(torch.log2(torch.diagonal(rvals.detach(), dim1=-2, dim2=-1)), dim=-2) / seq_length
+    # print(f'rval sum: {torch.log2(rvals.diagonal(dim1=-2, dim2=-1)).sum(dim=-2)}')
+    return LEs, rvals, J
 
 
 def oneStepVarQR(J, Q):

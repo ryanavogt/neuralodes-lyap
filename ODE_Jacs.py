@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
 
 def net_der(model, xi, yi):
     W = model[0].weight
@@ -30,14 +32,26 @@ def numerical_der(model, xi, yi, eps= 0.01):
     return jac
 
 
-def nonlinear_pendulum(y, omega_0 = torch.sqrt(torch.Tensor([9.81])).double()):
+def nonlinear_pendulum(y, omega_0=torch.sqrt(torch.Tensor([9.81])).double().to(device)):
     dtheta = y[:, -1].unsqueeze(-1)
-    dtheta = torch.hstack([torch.zeros_like(dtheta), dtheta])
-    dv = -omega_0**2 * torch.sin(y[:, 0]).double().unsqueeze(-1)
+    # dtheta = torch.hstack([torch.zeros_like(dtheta), dtheta])
+    dtheta = torch.hstack([torch.zeros_like(dtheta), torch.ones_like(dtheta)])
+    dv = -omega_0 ** 2 * torch.cos(y[:, 0]).double().unsqueeze(-1)
+    # dv = -omega_0 ** 2 * torch.sin(y[:, 0]).double().unsqueeze(-1)
     dv = torch.hstack([dv, torch.zeros_like(dv)])
-    # dy = torch.vstack([dtheta, dv]).T
     J = torch.dstack([dtheta, dv])
     # print(f'dy shape: {dy.shape}')
+    return J
+
+
+def simple_pendulum(y, omega_0 = torch.sqrt(torch.Tensor([9.81])).double().to(device)):
+    dtheta = y[:, -1].unsqueeze(-1)
+    # dtheta = torch.hstack([torch.zeros_like(dtheta), dtheta])
+    dtheta = torch.hstack([torch.zeros_like(dtheta), torch.ones_like(dtheta)])
+    # dv = -2* omega_0 ** 2 * y[:, 0].unsqueeze(-1)
+    dv = -(omega_0 ** 2) * torch.ones_like(y[:, 0]).unsqueeze(-1)
+    dv = torch.hstack([dv, torch.zeros_like(dv)])
+    J = torch.dstack([dtheta, dv])
     return J
 
 
@@ -127,8 +141,8 @@ def ode_jacobian(model, yi, xi=0, h=0.01, integrator='rk4'):
 
     # Calculate quantities for integrator
     # print(f'yi shape: {yi.shape}')
-    K = torch.zeros((order, batch_size, dims))
-    dy = torch.zeros((order, batch_size, dims))
+    K = torch.zeros((order, batch_size, dims)).to(device)
+    dy = torch.zeros((order, batch_size, dims)).to(device)
 
     # Calculate K's of integration method
     for i in range(order):
@@ -150,7 +164,7 @@ def ode_jacobian(model, yi, xi=0, h=0.01, integrator='rk4'):
     return dyn
 
 
-def ode_lyapunov(model, y_list, h=0.01, eps= 1, integrator='rk4'):
+def ode_lyapunov(model, y_list, h=0.01, eps= 0.1, integrator='rk4'):
     cuda = next(model.parameters()).is_cuda
     if cuda:
         device = torch.device('cuda')
@@ -158,11 +172,11 @@ def ode_lyapunov(model, y_list, h=0.01, eps= 1, integrator='rk4'):
         device = torch.device('cpu')
     seq_length, state_dim = y_list.shape
     rvals = torch.eye(state_dim).unsqueeze(0).repeat(seq_length, 1, 1).to(device)  # storage
-    Q = torch.eye(state_dim)*eps
+    Q = torch.eye(state_dim).to(device)*eps
 
     with torch.no_grad():
         # First, warmup to get eigenvectors to converge
-        J= ode_jacobian(model, y_list, h=h, integrator=integrator)
+        J= ode_jacobian(model, y_list.to(device), h=h, integrator=integrator)
         # ynew_list.append(ynew)
         for i in range(seq_length):
             qr_dict = oneStepVarQR(J[i], Q)
@@ -180,40 +194,49 @@ def ode_lyapunov(model, y_list, h=0.01, eps= 1, integrator='rk4'):
     return LEs, rvals, J
 
 
-def dysys_lyapunov(y_list, h=0.01, eps=1, system='pendulum'):
+def dysys_lyapunov(y_list, h=0.01, eps=1, system='dy_sys', alt = False):
     cuda = torch.cuda.is_available()
     if cuda:
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
 
-    if system == 'pendulum':
+    if system == 'dy_sys':
         f = nonlinear_pendulum
+    if system == 'simple':
+        f = simple_pendulum
     seq_length, state_dim = y_list.shape
     qvects = []
     rvals = torch.eye(state_dim).unsqueeze(0).repeat(seq_length, 1, 1).to(device)  # storage
-    Q = torch.eye(state_dim).double() * eps
+    Q = torch.eye(state_dim).double().to(device) * eps
 
-    with torch.no_grad():
-        # First, warmup to get eigenvectors to converge
+    if alt:
         J = f(y_list)
-        # ynew_list.append(ynew)
-        for i in range(seq_length):
-            # Q = torch.matmul(J[i], Q)
-            qr_dict = oneStepVarQR(J[i], Q)
-            Q, r = qr_dict['Q'] * eps, qr_dict['R'] / eps
+        X = torch.exp(J)
+        U, S, V = torch.linalg.svd(X.transpose(-2, -1)@X)
+        LEs = 1/torch.arange(X.shape[0])*torch.log2(torch.sqrt(S))
 
-        # Then, calculate evolution and track R values simultaneously
-        J = f(y_list)
-        # ynew_list.append(ynew)
-        for i in range(seq_length):
-            # Q = torch.matmul(J[i], Q)
-            qr_dict = oneStepVarQR(J[i], Q)
-            Q, r = qr_dict['Q'] * eps, qr_dict['R'] / eps
-            qvects.append(Q)
-            rvals[i] = r
-    qvects = torch.vstack(qvects)
-    LEs = torch.sum(torch.log2(torch.diagonal(rvals.detach(), dim1=-2, dim2=-1)), dim=-2) / seq_length
+    else:
+        with torch.no_grad():
+            # First, warmup to get eigenvectors to converge
+            J = f(y_list)
+            # ynew_list.append(ynew)
+            for i in range(seq_length):
+                # Q = torch.matmul(J[i], Q)
+                qr_dict = oneStepVarQR(J[i], Q)
+                Q, r = qr_dict['Q'] * eps, qr_dict['R']
+
+            # Then, calculate evolution and track R values simultaneously
+            J = f(y_list)
+            # ynew_list.append(ynew)
+            for i in range(seq_length):
+                # Q = torch.matmul(J[i], Q)
+                qr_dict = oneStepVarQR(J[i], Q)
+                Q, r = qr_dict['Q'] * eps, qr_dict['R']/eps
+                qvects.append(Q)
+                rvals[i] = r
+        qvects = torch.vstack(qvects)
+        LEs = torch.sum(torch.log2(torch.diagonal(rvals.detach(), dim1=-2, dim2=-1)), dim=-2) / seq_length
     # print(f'rval sum: {torch.log2(rvals.diagonal(dim1=-2, dim2=-1)).sum(dim=-2)}')
     return LEs, rvals, J
 

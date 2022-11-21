@@ -53,17 +53,21 @@ def create_grid_data(tmax=2*np.pi, dt=1.0, d_theta0=5.0, A=1.0, k=1.0, b=0.5, g=
     omega_0 = np.sqrt(g)
     y0 = np.arange(-np.pi, np.pi, 0.05)
     dy0 = np.arange(-d_theta0, d_theta0, 0.05)
-    y_init = np.meshgrid(y0, t, dy0, A)
+    y_init = np.meshgrid(y0, dy0, t, A)
     derivs = grid_pendulum(y_init, b=b, omega_0=omega_0)
     pend = partial(pendulum, A=A, b=b, omega_0=omega_0)
     x = rk4_step_func_t(pend, t=y_init[0], x=derivs, dt=np.ones_like(y_init[1])*dt)
-    return y_init, x
+    x_out = np.vstack([x, np.expand_dims(y_init[-2], 0), np.expand_dims(y_init[-1], 0)]).transpose()
+    x_out = np.vstack(x_out)
+    y_init = np.vstack(np.array(y_init).transpose())
+    return np.reshape(y_init, (-1, 4)), np.reshape(x_out, (-1, 4))
 
 
 def grid_pendulum(y_init, b=0.1, omega_0=np.sqrt(9.81)):
     t, theta, dtheta, A = y_init
     ddtheta = -omega_0 ** 2 * np.sin(theta) + (-b * dtheta + A * np.cos(k * t))
     return [dtheta, ddtheta]
+
 
 def pendulum(t, y, A=1.0, k=1.0, b=0.1, omega_0=np.sqrt(9.81)):
     theta = y[0]  # - np.pi*(np.abs(y[0])//np.pi)*np.sign(y[0])
@@ -108,6 +112,17 @@ def create_dataloader(x, x_test=None, batch_size=BATCH_SIZE, shuffle=True):
     return train_loader, test_loader
 
 
+def create_grid_dataloader(x, target, batch_size=BATCH_SIZE, shuffle=True):
+    dataset = torch.utils.data.TensorDataset(
+        torch.tensor(np.asarray(x), dtype=torch.double).to(device),
+        torch.tensor(np.asarray(target)[:, :2], dtype=torch.double).to(device),
+    )
+
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
+
+    return train_loader
+
+
 def euler_step_func(f, x, dt, monitor=False):
     """The 'forward' Euler, a one stage Runge Kutta."""
     k1 = f(x)
@@ -150,6 +165,7 @@ def rk4_step_func_t(f, x, dt, t= None, monitor=False):
         return x_out, torch.vstack([k1, k2, k3, k4])
     else:
         return x_out
+
 
 def rk4_38_step_func(f, x, dt, monitor=False):
     """"The alternate '3/8' RK4, a four-stage Runge Kutta with different coefficients """
@@ -362,11 +378,11 @@ if __name__ == '__main__':
     b = 1.0  # Damping coefficient
     # A = 0         # Driving force magnitude
     g = 1.0  # Acceleration due to gravity
-    train_min = 3  # Minimum A used for training
+    train_min = 0  # Minimum A used for training
     # hs = [0.0001, 0.001, 0.01, 0.1]
     h = 0.01
 
-    for train_max in [5, 7, 9]:
+    for train_max in [3, 5, 7, 9]:
         # train_max = 10  # Maximum A used for training
 
         A_train_name = f'{train_min}_{train_max}'
@@ -452,42 +468,50 @@ if __name__ == '__main__':
 
         # Generate Train and Test Data
         if train_models:
+            x_train_full = []
+            x_test_full = []
+            target_train_full = []
+            target_test_full = []
             for A in A_list_train[A_train_name]:
                 for b in b_list_train:
-                    x_train_full = []
-                    x_test_full = []
+
                     if grid:
                         fname = f'{folder}/Data/GridData_A{A}_b{b}.p'
-                    else:
-                        fname = f'{folder}/Data/AltData_A{A}_b{b}.p'
-                    if not os.path.exists(fname):
+                        tname = f'{folder}/Data/GridData_A{A}_b{b}_h{h}_targets.p'
+                    if not os.path.exists(tname):
                         print(f'Generating Data for A = {A}')
                         if grid:
                             x, target = create_grid_data(dt=h, A=A, b=b, k=k, g=g)
-                            x_train = (x, target)
-                            x_test = (x, target)
-                        else:
-                            x_train = generate_datasets(A, b, theta_train, dt, train_steps)
-                            # print(f'Max: {x_train[:, 0].max()}, Min: {x_train[:, 0].min()}')
-                            x_test = generate_datasets(A, b, theta_test, dt, train_steps)
+                            print(f'x Shape: {x.shape}')
+                            print(f'Target Shape: {target.shape}')
+                            x_train = np.array(x)
+                            target_train = np.array(target)
+                            x_test = np.array(x)
+                            target_test = np.array(target)
                         torch.save((x_train, x_test), fname)
+                        torch.save((target_train, target_test), tname)
                     else:
                         print(f'Loading Data for A = {A}')
                         x_train, x_test = torch.load(fname)
+                        target_train, target_test = torch.load(tname)
                     x_train_full.append(x_train)
                     x_test_full.append(x_test)
+                    target_train_full.append(target_train)
+                    target_test_full.append(target_test)
                 if plot:
                     plt.figure(100)
                     plt.plot(x_train[0, 0], x_train[0, 1], label=A)
             x_train_full = np.vstack(x_train_full)
             x_test_full = np.vstack(x_test_full)
-            plt.figure(49)
-            plt.hist(x_train_full[:, 0])
-            plt.xlabel(r'$\theta$')
-            plt.ylabel(f'Frequency')
-            plt.title(f'Trajectory Distributions for A = {train_min} to {train_max}')
-            plt.savefig(f'{folder}/Figures/Histograms/trajHist_{train_min}_{train_max}.png')
-            plt.close()
+            target_train_full = np.vstack(target_train_full)
+            target_test_full = np.vstack(target_test_full)
+            # plt.figure(49)
+            # plt.hist(x_train_full[:, 0])
+            # plt.xlabel(r'$\theta$')
+            # plt.ylabel(f'Frequency')
+            # plt.title(f'Trajectory Distributions for A = {train_min} to {train_max}')
+            # plt.savefig(f'{folder}/Figures/Histograms/trajHist_{train_min}_{train_max}.png')
+            # plt.close()
 
         if plot:
             plt.figure(100)
@@ -501,15 +525,15 @@ if __name__ == '__main__':
 
         # Train ODEnets
         if train_models:
-            train_loader, test_loader = create_dataloader(x_train_full[::train_steps, :IN_DIM],
-                                                          x_test_full[::train_steps, :IN_DIM],
+            train_loader = create_grid_dataloader(x_train_full,
+                                                          target=target_train_full,
                                                           batch_size=BATCH_SIZE, shuffle=True)
             for integrator in ['euler', 'rk4']:
                 model_name = f'{folder}/Models/model_{suffix}{integrator}.p'
                 if os.path.isfile(model_name):
                     print(f'Loading {integrator} Model')
                     ODEnet, ode_loss_hist, best_loss = torch.load(model_name, map_location=device)
-                    ODEnet, ode_loss_hist, best_loss = train(ODEnet, train_loader, test_loader=test_loader,
+                    ODEnet, ode_loss_hist, best_loss = train(ODEnet, train_loader, test_loader=train_loader,
                                                              method=integrator, dt=dt,
                                                              fig_name=f'{folder}/Train Losses/loss_plot_{suffix}{integrator}.png',
                                                              loss_list=ode_loss_hist, best_loss=best_loss, h=train_h)

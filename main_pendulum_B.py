@@ -47,23 +47,24 @@ def create_driven_data(tmax=20, dt=1, theta0=2.0, d_theta0=0.0, A=1.0, k=1.0, b=
                       np.expand_dims(A_sol, axis=1)])
 
 
-def create_grid_data(tmax=2*np.pi, dt=1.0, d_theta0=5.0, A=1.0, k=1.0, b=0.5, g=9.81):
+def create_grid_data(train_steps, tmax=2*np.pi, dt=1.0, dtheta=5.0, A=1.0, k=1.0, b=0.5, g=9.81):
     t_lim = (0, tmax)
-    t = np.arange(0, tmax, dt)
     omega_0 = np.sqrt(g)
-    y0 = np.arange(-np.pi, np.pi, 0.05)
-    dy0 = np.arange(-d_theta0, d_theta0, 0.05)
-    y_init = np.meshgrid(y0, t, dy0, A)
-    derivs = grid_pendulum(y_init, b=b, omega_0=omega_0)
-    pend = partial(pendulum, A=A, b=b, omega_0=omega_0)
-    x = rk4_step_func_t(pend, t=y_init[0], x=derivs, dt=np.ones_like(y_init[1])*dt)
-    return y_init, x
+    t = np.random.uniform(low = 0, high=tmax, size=train_steps)
+    y = np.random.uniform(low=-np.pi, high=np.pi, size=train_steps)
+    dy = np.random.uniform(low=-dtheta, high=dtheta, size=train_steps)
+    A_sol = np.ones_like(t)*A
+    derivs = np.array([y, dy])
+    pend = partial(pendulum, A=A, b=b, omega_0=omega_0, k=k)
+    target_y = rk4_step_func_t(pend, t=t, x=derivs, dt=np.ones_like(y)*dt)
+    return np.vstack([y, dy, t, A_sol]).T, np.vstack([target_y[0], target_y[1], t, A_sol]).T
 
 
 def grid_pendulum(y_init, b=0.1, omega_0=np.sqrt(9.81)):
     t, theta, dtheta, A = y_init
     ddtheta = -omega_0 ** 2 * np.sin(theta) + (-b * dtheta + A * np.cos(k * t))
     return [dtheta, ddtheta]
+
 
 def pendulum(t, y, A=1.0, k=1.0, b=0.1, omega_0=np.sqrt(9.81)):
     theta = y[0]  # - np.pi*(np.abs(y[0])//np.pi)*np.sign(y[0])
@@ -286,6 +287,20 @@ def train(ODEnet, train_loader, test_loader=None, lr=LEARNING_RATE, wd=WEIGHT_DE
     return ODEnet, epoch_losses, best_loss
 
 
+def generate_grid_datasets(A, b, theta_0s, train_steps, dtheta=5.0, tmax=2*np.pi, h=0.1, g=9.81, k=1):
+    x_list = []
+    target_list = []
+    for theta_0i in theta_0s:
+        xi, target_i = create_grid_data(train_steps, tmax=tmax, dtheta=dtheta, dt=h, A=A, b=b, g=g, k=k)
+        target_i = shift_vals(target_i, h, dt)
+        n_batches = xi.shape[0] // (BATCH_SIZE * train_steps)
+        x_list.append(xi[:BATCH_SIZE * train_steps * n_batches])
+        target_list.append(target_i[:BATCH_SIZE * train_steps * n_batches])
+    x_set = np.vstack(x_list)
+    target_set = np.vstack(target_list)
+    return x_set, target_set
+
+
 def generate_datasets(A, b, theta_0s, dt, train_steps, h=0.1, g=9.81, k=1):
     x_list = []
     for theta_0i in theta_0s:
@@ -457,19 +472,19 @@ if __name__ == '__main__':
                     x_train_full = []
                     x_test_full = []
                     if grid:
-                        fname = f'{folder}/Data/GridData_A{A}_b{b}.p'
+                        fname = f'{folder}/Data/GridData_A{A}_b{b}_h{h}.p'
                     else:
                         fname = f'{folder}/Data/AltData_A{A}_b{b}.p'
                     if not os.path.exists(fname):
                         print(f'Generating Data for A = {A}')
                         if grid:
-                            x, target = create_grid_data(dt=h, A=A, b=b, k=k, g=g)
+                            x, target = generate_grid_datasets(A=A, b=b, theta_0s=theta_train, k=k, g=g,
+                                                               train_steps=train_steps, h=h)
                             x_train = (x, target)
-                            x_test = (x, target)
                         else:
                             x_train = generate_datasets(A, b, theta_train, dt, train_steps)
                             # print(f'Max: {x_train[:, 0].max()}, Min: {x_train[:, 0].min()}')
-                            x_test = generate_datasets(A, b, theta_test, dt, train_steps)
+                        x_test = generate_datasets(A, b, theta_test, dt, train_steps)
                         torch.save((x_train, x_test), fname)
                     else:
                         print(f'Loading Data for A = {A}')

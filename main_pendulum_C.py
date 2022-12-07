@@ -481,7 +481,7 @@ if __name__ == '__main__':
                     if not os.path.exists(tname):
                         print(f'Generating Data for A = {A}')
                         if grid:
-                            x, target = create_grid_data(dt=h, A=A, b=b, k=k, g=g)
+                            x, target = create_grid_data(dt=h*10, A=A, b=b, k=k, g=g)
                             print(f'x Shape: {x.shape}')
                             print(f'Target Shape: {target.shape}')
                             x_train = np.array(x)
